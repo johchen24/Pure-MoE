@@ -3,6 +3,60 @@ from torch.nn import functional as F
 from transformers.generation.stopping_criteria import (
     StoppingCriteriaList,
 )
+import numpy as np
+
+
+def calculate_jsd(teacher_probs, student_probs, eps=1e-8):
+    """
+    Calculate Jensen-Shannon Divergence between teacher and student probability distributions.
+    
+    Args:
+        teacher_probs: Probability distribution from teacher (strong) experts
+        student_probs: Probability distribution from student (weak) experts  
+        eps: Small constant to avoid log(0)
+    
+    Returns:
+        JSD score (higher = more conflict between distributions)
+    """
+    # Ensure probabilities are normalized and add small epsilon
+    teacher_probs = teacher_probs + eps
+    student_probs = student_probs + eps
+    teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)
+    student_probs = student_probs / student_probs.sum(dim=-1, keepdim=True)
+    
+    # Calculate average distribution M = (P + Q) / 2
+    m = 0.5 * (teacher_probs + student_probs)
+    
+    # Calculate KL divergences
+    kl_pm = F.kl_div(torch.log(teacher_probs), m, reduction='none').sum(dim=-1)
+    kl_qm = F.kl_div(torch.log(student_probs), m, reduction='none').sum(dim=-1)
+    
+    # JSD = 0.5 * (KL(P||M) + KL(Q||M))
+    jsd = 0.5 * (kl_pm + kl_qm)
+    return jsd
+
+
+def adaptive_beta_scaling(jsd_score, base_beta=0.5, jsd_threshold=0.1, max_beta=1.0, min_beta=0.1):
+    """
+    Map JSD score to dynamic beta value.
+    
+    Args:
+        jsd_score: Jensen-Shannon divergence score
+        base_beta: Base beta value (default SCMoE beta)
+        jsd_threshold: JSD threshold for scaling
+        max_beta: Maximum beta value for high conflict
+        min_beta: Minimum beta value for low conflict
+    
+    Returns:
+        Dynamic beta value
+    """
+    # Normalize JSD score (clamp to reasonable range)
+    jsd_normalized = torch.clamp(jsd_score / jsd_threshold, 0.0, 2.0)
+    
+    # Linear scaling: low JSD -> min_beta, high JSD -> max_beta
+    beta_dynamic = min_beta + (max_beta - min_beta) * (jsd_normalized / 2.0)
+    
+    return beta_dynamic
 
 @torch.no_grad()
 def scmoe(
@@ -22,6 +76,10 @@ def scmoe(
     teacher_num_experts_per_tok=2,
     student_routed_tok=[0],
     student_num_experts_per_tok=1,
+    dynamic_beta=False,
+    jsd_threshold=0.1,
+    max_beta=1.0,
+    min_beta=0.1,
 ):
 
     batch_size, prefix_len = input_ids.size()
@@ -67,7 +125,28 @@ def scmoe(
         )
         next_token_logits_student = outputs_student.logits[:, -1, :]
         next_token_logits_student = next_token_logits_student / student_t
-        diffs = (1 + beta) * next_token_scores - beta * next_token_logits_student
+        # Dynamic beta scaling based on JSD between teacher and student distributions
+        if dynamic_beta:
+            # Convert logits to probabilities for JSD calculation
+            teacher_probs = F.softmax(next_token_scores, dim=-1)
+            student_probs = F.softmax(next_token_logits_student, dim=-1)
+            
+            # Calculate Jensen-Shannon Divergence
+            jsd_score = calculate_jsd(teacher_probs, student_probs)
+            
+            # Map JSD to dynamic beta value
+            beta_dynamic = adaptive_beta_scaling(jsd_score, beta, jsd_threshold, max_beta, min_beta)
+            
+            # Apply dynamic beta in contrastive formula
+            diffs = (1 + beta_dynamic) * next_token_scores - beta_dynamic * next_token_logits_student
+            
+            # Optional: Print debug info (remove in production)
+            if step < 5:  # Only print first few tokens
+                print(f"Step {step}: JSD={jsd_score.item():.4f}, beta_dynamic={beta_dynamic.item():.4f}")
+        else:
+            # Use fixed beta (original SCMoE behavior)
+            diffs = (1 + beta) * next_token_scores - beta * next_token_logits_student
+            
         cdlogits = diffs.masked_fill(next_token_scores < cutoff, -float("inf"))
         if not early_stop and eos_token_id != None:
             cdlogits[:, eos_token_id] = -float("inf")

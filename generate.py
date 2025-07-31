@@ -110,6 +110,12 @@ def args_parse():
     parser.add_argument("--student_routed_tok", default=0, type=int)
 
     parser.add_argument("--dynamic_expert_routing_threshold", default=0.6, type=float)
+    
+    # Dynamic beta scaling parameters
+    parser.add_argument("--dynamic_beta", action="store_true", help="Enable dynamic beta scaling based on JSD")
+    parser.add_argument("--jsd_threshold", default=0.1, type=float, help="JSD threshold for beta scaling")
+    parser.add_argument("--max_beta", default=1.0, type=float, help="Maximum beta value for high conflict")
+    parser.add_argument("--min_beta", default=0.1, type=float, help="Minimum beta value for low conflict")
 
     args = parser.parse_args()
     return args
@@ -307,6 +313,10 @@ def generate(rank, args):
                 teacher_num_experts_per_tok=args.num_experts_per_tok,
                 student_routed_tok=MoE_mapping_student[args.student_routed_tok],
                 student_num_experts_per_tok=args.student_num_experts_per_tok,
+                dynamic_beta=args.dynamic_beta,
+                jsd_threshold=args.jsd_threshold,
+                max_beta=args.max_beta,
+                min_beta=args.min_beta,
             )
         if args.decoding_method == "scmoe_with_sampling":
             if args.routed_tok == 0:
