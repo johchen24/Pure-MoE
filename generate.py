@@ -23,6 +23,8 @@ from transformers.generation.stopping_criteria import (
     STOPPING_CRITERIA_INPUTS_DOCSTRING,
     add_start_docstrings,
 )
+#New added
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union, Sequence
 from itertools import combinations
 
@@ -31,7 +33,70 @@ def generate_combinations(total_length, num_to_remove):
     indices = range(total_length)
     result = list(combinations(indices, num_to_remove))
     return [list(i) for i in result]
+    
+#Added stopping text criteria
+class StopAfterAnswerWindowStrict(StoppingCriteria):
+    """
+    Start checking only AFTER we see an 'answer phrase' (e.g., 'the answer is').
+    Then allow up to `window_words` words; if a stop string (e.g., '\n\nQuestion:')
+    appears within that window, stop immediately.
+    If the phrase never appears, NEVER stop (no fallback).
+    """
+    def __init__(self, tokenizer, stop_strings, start_pos: int,
+                 answer_phrase_regex: str = r"(?i)\b(the\s+answer\s+is|answer\s*[:=])\b",
+                 warmup_tokens: int = 8,
+                 window_words: int = 20,
+                 check_every: int = 2):
+        self.tok = tokenizer
+        self.stop_strings = stop_strings
+        self.start_pos = start_pos
+        self.answer_rx = re.compile(answer_phrase_regex)
+        self.warmup_tokens = warmup_tokens
+        self.window_words = window_words
+        self.check_every = check_every
+        self._step = 0
+        self._anchor_idx = None  # char offset in decoded tail where phrase ends
 
+    def _count_words(self, s: str) -> int:
+        return len(re.findall(r"\b\w+\b", s))
+
+    def __call__(self, input_ids, scores, **kwargs):
+        self._step += 1
+        new_tokens = input_ids.shape[1] - self.start_pos
+        if new_tokens < self.warmup_tokens or (self._step % self.check_every):
+            return False
+
+        tail = self.tok.decode(
+            input_ids[0, self.start_pos:].tolist(),
+            skip_special_tokens=False
+        )
+
+        # Anchor on "the answer is ..."
+        if self._anchor_idx is None:
+            m = self.answer_rx.search(tail)
+            if not m:
+                # STRICT: do NOT stop before the phrase appears
+                return False
+            self._anchor_idx = m.end()
+
+        # After the phrase: enforce the window
+        after = tail[self._anchor_idx:]
+
+        # If a stop string appears within the window_words → stop now
+        earliest_stop = None
+        for s in self.stop_strings:
+            i = after.find(s)
+            if i != -1 and (earliest_stop is None or i < earliest_stop):
+                earliest_stop = i
+
+        if earliest_stop is not None:
+            words_before_stop = self._count_words(after[:earliest_stop])
+            if words_before_stop <= self.window_words:
+                return True
+
+        # Otherwise, never stop early (let max_new_tokens/EOS handle it)
+        return False
+#-------------------------------------------------
 
 class StopAtSpecificTokenCriteria(StoppingCriteria):
 
@@ -101,6 +166,9 @@ def args_parse():
     )  
     parser.add_argument("--cd_st", default=1.0, type=float, help="student temperature")
 
+    # Adaptive beta (AdaCAD-style) for SCMoE
+    parser.add_argument("--dynamic_beta", action="store_true")
+
     parser.add_argument("--dola_early_exit_layers", default="0,2,4,6,8,10,12,14,32", type=str)
     parser.add_argument("--dola_mature_layer", default=32, type=int)
 
@@ -111,12 +179,19 @@ def args_parse():
 
     parser.add_argument("--dynamic_expert_routing_threshold", default=0.6, type=float)
     
-    # Dynamic beta scaling parameters
-    parser.add_argument("--dynamic_beta", action="store_true", help="Enable dynamic beta scaling based on JSD")
-    parser.add_argument("--jsd_threshold", default=0.1, type=float, help="JSD threshold for beta scaling")
-    parser.add_argument("--max_beta", default=1.0, type=float, help="Maximum beta value for high conflict")
-    parser.add_argument("--min_beta", default=0.1, type=float, help="Minimum beta value for low conflict")
+    #Added stopping text criteria
+    parser.add_argument(
+    "--stop_text",
+    type=str,
+    default="",
+    help="Comma-separated stop substrings (e.g., '\\n\\nQuestion:,\\nQuestion:,Q:')",
+    )
+    #--------------------------------------------------------------------------------------
 
+    #Added argument to resume answering questions in the benchmark testing in-case the run gets interupted.
+    parser.add_argument("--resume", action="store_true")
+    #-------------------------------------------------------------------------------------
+    
     args = parser.parse_args()
     return args
 
@@ -130,6 +205,7 @@ def generate(rank, args):
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path, trust_remote_code=True
     )
+    
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
         print("pad_token_id is None, set it to eos_token_id")
@@ -140,12 +216,12 @@ def generate(rank, args):
         print("both eos_token_id and pad_token_id are None")
 
     config = AutoConfig.from_pretrained(args.model_name_or_path, trust_remote_code=True)
-    if "deepseek-moe" in args.model_name_or_path or "Mixtral" in args.model_name_or_path:
+    if "Qwen3_30B_A3B" in args.model_name_or_path or "Mixtral" in args.model_name_or_path:
         config.num_experts_per_tok = args.num_experts_per_tok
         if args.routed_tok == 0:
             config.routed_tok = [_ for _ in range(args.num_experts_per_tok)]
         else:
-            config.routed_tok = generate_combinations(8 if "Mixtral" in args.model_name_or_path else 64, args.num_experts_per_tok)[args.routed_tok]
+            config.routed_tok = generate_combinations(8 if "Mixtral" in args.model_name_or_path else 128, args.num_experts_per_tok)[args.routed_tok]
     if args.decoding_method == "dynamic":
         config.dynamic_expert_routing_threshold = args.dynamic_expert_routing_threshold
     
@@ -183,42 +259,102 @@ def generate(rank, args):
     prompt_lst = prompt_lst[rank :: args.num_processes]
     print(f"the total number of prompts for rank {rank}: {len(prompt_lst)}")
 
+    # --- Resume: filter out prompts already done (from shard files and/or a prior final file)
+    if getattr(args, "resume", False):
+        done = set()
+    
+        def _read_done(path: str):
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    df = pd.read_json(path, lines=True)
+                    if "idx" in df.columns:
+                        return set(df["idx"].tolist())
+            except Exception:
+                pass
+            return set()
+    
+        # If a prior final outfile exists, honor it
+        done |= _read_done(args.outfile)
+    
+        # Collect finished idxs from any existing per-rank shard files (…jsonl0, …jsonl1, …)
+        r = 0
+        while True:
+            shard = args.outfile + f"{r}"
+            if not os.path.exists(shard):
+                break
+            done |= _read_done(shard)
+            r += 1
+    
+        if done:
+            before = len(prompt_lst)
+            prompt_lst = [d for d in prompt_lst if d["idx"] not in done]
+            print(
+                f"resuming: will skip {len(done)} finished idxs; "
+                f"remaining {len(prompt_lst)} of {before} for rank {rank}"
+            )
+    # ---------------------------------------------------------------------------------------------------
+    
+    
     s = time.time()
     
     for start in tqdm(range(0, len(prompt_lst), args.batch_size), disable=rank != 0):
         stopping_criteria = StoppingCriteriaList()
+            
         if "deepseek-moe" in args.model_name_or_path:
             if "mbpp" in args.infile:
                 stopping_criteria.append(
-                    StopAtSpecificTokenCriteria(i=i, token_id_list=[[58, 95742, 60]])
+                    StopAtSpecificTokenCriteria(token_id_list=[[58, 95742, 60]])
                 )
             if "human_eval" in args.infile:
                 stopping_criteria.append(
                     StopAtSpecificTokenCriteria(
-                        i=i,
+                        
                         token_id_list=[[185, 1558], [185, 351, 5589, 1531, 1442, 2318]],
                     )
                 )
             else:
                 stopping_criteria.append(
-                    StopAtSpecificTokenCriteria(i=i, token_id_list=[[185, 185]])
+                    StopAtSpecificTokenCriteria(token_id_list=[[185, 185]])
                 )
         elif "Mixtral" in args.model_name_or_path:
             if "mbpp" in args.infile:
                 stopping_criteria.append(
                     StopAtSpecificTokenCriteria(
-                        i=i, token_id_list=[[28792, 28757, 6349, 28793]]
+                        token_id_list=[[28792, 28757, 6349, 28793]]
                     )
                 )
             if "human_eval" in args.infile:
                 stopping_criteria.append(
                     StopAtSpecificTokenCriteria(
-                        i=i, token_id_list=[[13, 1270], [13, 335, 1848, 861, 860, 859]]
+                        token_id_list=[[13, 1270], [13, 335, 1848, 861, 860, 859]]
                     )
                 )
             else:
                 stopping_criteria.append(
-                    StopAtSpecificTokenCriteria(i=i, token_id_list=[[13, 13]])
+                    StopAtSpecificTokenCriteria(token_id_list=[[13, 13]])
+                )
+        elif "Qwen3" in args.model_name_or_path or "qwen3" in args.model_name_or_path:
+            if "mbpp" in args.infile:
+                #   '[DONE]' -> [64920, 5225, 60]
+                #   ' [DONE]' -> [58, 95742, 60]
+                stopping_criteria.append(
+                    StopAtSpecificTokenCriteria(
+                        token_id_list=[[64920, 5225, 60], [58, 95742, 60]]
+                    )
+                )
+            elif "human_eval" in args.infile:
+                #   '\ndef' -> [198, 750]
+                #   '\nif __name__ ==' -> [198, 333, 1304, 606, 563, 621]
+                stopping_criteria.append(
+                    StopAtSpecificTokenCriteria(
+                        token_id_list=[[198, 750], [198, 333, 1304, 606, 563, 621]]
+                    )
+                )
+            else:
+                #  "\nQuestion:" -> [198, 14582, 25]
+                #  "\n\nQuestion:" -> [271, 14582, 25]
+                stopping_criteria.append(
+                    StopAtSpecificTokenCriteria(token_id_list=[[198, 14582, 25], [271, 14582, 25]])
                 )
         
         if start % 20 == 0 and rank == 0:
@@ -231,6 +367,26 @@ def generate(rank, args):
         input_ids = model_inputs["input_ids"].to(model.device)
         attention_mask = model_inputs["attention_mask"].to(model.device)
         prompt_len = input_ids.size(1)
+        
+        # Build substring stopper bound to this batch's prompt start
+        raw_list = [s.strip() for s in (args.stop_text.split(",") if args.stop_text else [])]
+        stop_strings = [s.replace("\\n", "\n") for s in raw_list if s]
+        if stop_strings:
+   
+            # NEW (strict answer-window, no fallback):
+            stopping_criteria.append(
+                StopAfterAnswerWindowStrict(
+                    tokenizer,
+                    stop_strings=stop_strings,         # e.g., ["\n\nQuestion:"]
+                    start_pos=prompt_len,
+                    answer_phrase_regex=r"(?i)\b(the\s+answer\s+is|answer\s*[:=])\b",
+                    warmup_tokens=8,
+                    window_words=20,
+                    check_every=2,
+                )
+            )
+        #---------------------------------------------------------------------------
+        
         if args.decoding_method == "greedy" or args.decoding_method == "dynamic":
             outputs = model.generate(
                 input_ids,
@@ -285,16 +441,16 @@ def generate(rank, args):
                 MoE_mapping_teacher = [[_ for _ in range(args.num_experts_per_tok)]]
             else:
                 MoE_mapping_teacher = generate_combinations(
-                    8 if "Mixtral" in args.model_name_or_path else 64,
+                    8 if "Mixtral" in args.model_name_or_path else 128,
                     args.num_experts_per_tok,
                 )
-            if (args.student_routed_tok == 8 or args.student_routed_tok == 64) and args.student_num_experts_per_tok == 1:
+            if (args.student_routed_tok == 8 or args.student_routed_tok == 128) and args.student_num_experts_per_tok == 1:
                 MoE_mapping_student = [[_] for _ in range(args.student_routed_tok + 1)]
             elif args.student_routed_tok == 0:
                 MoE_mapping_student = [[_ for _ in range(args.student_num_experts_per_tok)]]
             else:
                 MoE_mapping_student = generate_combinations(
-                    8 if "Mixtral" in args.student_model_name_or_path else 64,
+                    8 if "Mixtral" in args.student_model_name_or_path else 128,
                     args.student_num_experts_per_tok,
                 )
             outputs = scmoe(
@@ -308,29 +464,26 @@ def generate(rank, args):
                 early_stop=args.early_stop,
                 alpha=args.cd_alpha,
                 beta=args.cd_beta,
+                dynamic_beta=args.dynamic_beta,
                 stopping_criteria=stopping_criteria,
                 teacher_routed_tok=MoE_mapping_teacher[args.routed_tok],
                 teacher_num_experts_per_tok=args.num_experts_per_tok,
                 student_routed_tok=MoE_mapping_student[args.student_routed_tok],
                 student_num_experts_per_tok=args.student_num_experts_per_tok,
-                dynamic_beta=args.dynamic_beta,
-                jsd_threshold=args.jsd_threshold,
-                max_beta=args.max_beta,
-                min_beta=args.min_beta,
             )
         if args.decoding_method == "scmoe_with_sampling":
             if args.routed_tok == 0:
                 MoE_mapping_teacher = [[_ for _ in range(args.num_experts_per_tok)]]
             else:
                 MoE_mapping_teacher = generate_combinations(
-                    8 if "Mixtral" in args.model_name_or_path else 64,
+                    8 if "Mixtral" in args.model_name_or_path else 128,
                     args.num_experts_per_tok,
                 )
             if args.student_routed_tok == 0:
                 MoE_mapping_student = [[_ for _ in range(args.student_num_experts_per_tok)]]
             else:
                 MoE_mapping_student = generate_combinations(
-                    8 if "Mixtral" in args.student_model_name_or_path else 64,
+                    8 if "Mixtral" in args.student_model_name_or_path else 128,
                     args.student_num_experts_per_tok,
                 )
             outputs = scmoe_with_sampling(
@@ -356,6 +509,7 @@ def generate(rank, args):
             clean_up_tokenization_spaces=True,
             skip_special_tokens=True,
         )
+        
         for prompt, generation in zip(cur_prompt_lst, generation_text):
             json_str = json.dumps(
                 {
