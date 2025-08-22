@@ -68,10 +68,20 @@ def scmoe(
 ):
 
     batch_size, prefix_len = input_ids.size()
-    model_kwargs = {}
-    model_kwargs_student = {}
-    model_kwargs["attention_mask"] = attention_mask
-    model_kwargs_student["attention_mask"] = attention_mask
+    # Prepare generation kwargs with cache_position for new HF caching API
+    model_kwargs = {"attention_mask": attention_mask, "use_cache": True}
+    try:
+        model_kwargs = model._prepare_model_kwargs_for_generation(input_ids, model_kwargs)
+    except AttributeError:
+        seq_len = input_ids.shape[-1]
+        model_kwargs["cache_position"] = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
+
+    model_kwargs_student = {"attention_mask": attention_mask, "use_cache": True}
+    try:
+        model_kwargs_student = model._prepare_model_kwargs_for_generation(input_ids, model_kwargs_student)
+    except AttributeError:
+        seq_len = input_ids.shape[-1]
+        model_kwargs_student["cache_position"] = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
     eos_token_id = eos_token_id if eos_token_id is not None else tokenizer.eos_token_id
     eos_token_id_tensor = (
         torch.tensor([eos_token_id]).to(model.device)

@@ -165,8 +165,7 @@ def args_parse():
         "--cd_tt", default=1.0, type=float, help="teacher temperature"
     )  
     parser.add_argument("--cd_st", default=1.0, type=float, help="student temperature")
-
-    # Adaptive beta (AdaCAD-style) for SCMoE
+    
     parser.add_argument("--dynamic_beta", action="store_true")
 
     parser.add_argument("--dola_early_exit_layers", default="0,2,4,6,8,10,12,14,32", type=str)
