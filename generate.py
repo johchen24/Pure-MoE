@@ -350,10 +350,11 @@ def generate(rank, args):
                     )
                 )
             else:
-                #  "\nQuestion:" -> [198, 14582, 25]
-                #  "\n\nQuestion:" -> [271, 14582, 25]
+                #  "\nQuestion" -> [198, 14582]
+                #  "\n\nQuestion" -> [271, 14582] or sometimes two singles: [198, 198, 14582]
+                #  ".\n\nQuestion" -> [382, 14582]
                 stopping_criteria.append(
-                    StopAtSpecificTokenCriteria(token_id_list=[[198, 14582, 25], [271, 14582, 25]])
+                    StopAtSpecificTokenCriteria(token_id_list=[[198, 14582], [271, 14582], [198, 198, 14582], [382, 14582]])
                 )
         
         if start % 20 == 0 and rank == 0:
