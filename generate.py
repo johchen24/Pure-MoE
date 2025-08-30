@@ -3,6 +3,9 @@ import transformers
 print(transformers.__version__)
 import json
 import torch
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import argparse
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import os
@@ -230,6 +233,7 @@ def generate(rank, args):
         device_map="auto",
         trust_remote_code=True,
         config=config,
+        attn_implementation="flash_attention_2"
     ).eval()
 
     if args.decoding_method == "cd":
@@ -242,6 +246,7 @@ def generate(rank, args):
             device_map="auto",
             config=config,
             trust_remote_code=True,
+            attn_implementation="flash_attention_2"
         ).eval()
 
     prompt_lst = []
