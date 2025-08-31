@@ -345,7 +345,7 @@ def generate(rank, args):
                 #   ' [DONE]' -> [58, 95742, 60]
                 stopping_criteria.append(
                     StopAtSpecificTokenCriteria(
-                        token_id_list=[[64920, 5225, 60], [58, 95742, 60]]
+                        token_id_list=[[64920, 5225, 60], [58, 95742, 60], [64920, 5225, 2533], [58, 95742, 2533]]
                     )
                 )
             elif "human_eval" in args.infile:
