@@ -207,6 +207,8 @@ def generate(rank, args):
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path, trust_remote_code=True
     )
+    # Prefer left padding for decoder-only LMs to avoid wasting compute on pads
+    tokenizer.padding_side = "left"
     
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -358,8 +360,9 @@ def generate(rank, args):
                 #  "\nQuestion" -> [198, 14582]
                 #  "\n\nQuestion" -> [271, 14582] or sometimes two singles: [198, 198, 14582]
                 #  ".\n\nQuestion" -> [382, 14582]
+                #  ".\nYou are" -> [624, 2610, 525]
                 stopping_criteria.append(
-                    StopAtSpecificTokenCriteria(token_id_list=[[198, 14582], [271, 14582], [198, 198, 14582], [382, 14582]])
+                    StopAtSpecificTokenCriteria(token_id_list=[[198, 14582], [271, 14582], [198, 198, 14582], [382, 14582], [624, 2610, 525]])
                 )
         
         if start % 20 == 0 and rank == 0:

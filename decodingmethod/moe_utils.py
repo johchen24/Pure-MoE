@@ -174,6 +174,8 @@ def scmoe(
         unfinished_sequences = unfinished_sequences & ~stopping_criteria(
             input_ids, None
         )
+        
+        
         if unfinished_sequences.max() == 0 or step == max_new_tokens - 1:
             stopped = True
         else:
