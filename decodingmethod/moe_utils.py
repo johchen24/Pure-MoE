@@ -171,9 +171,23 @@ def scmoe(
                 .prod(dim=0)
             )
 
-        unfinished_sequences = unfinished_sequences & ~stopping_criteria(
-            input_ids, None
-        )
+        # ORIGINAL:
+        # unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+        #     input_ids, None
+        # )
+
+        sc_met = stopping_criteria(input_ids, None)
+        # DEBUG: print at every step – last 10 token ids and recent decoded chunk
+        try:
+            all_tail_ids = input_ids[0, prefix_len:].detach().cpu().tolist()
+            last10_ids = all_tail_ids[-10:]
+            recent_chunk_ids = all_tail_ids[-50:]
+            recent_text = tokenizer.decode(recent_chunk_ids, skip_special_tokens=False)
+            print(f"[SCMOE-DBG] step={step} gen_len={len(all_tail_ids)} stop={bool(sc_met)} last10_ids={last10_ids} recent_text={recent_text}")
+        except Exception as _e:
+            print(f"[SCMOE-DBG] decode failed: {_e}")
+
+        unfinished_sequences = unfinished_sequences & ~sc_met
         
         
         if unfinished_sequences.max() == 0 or step == max_new_tokens - 1:

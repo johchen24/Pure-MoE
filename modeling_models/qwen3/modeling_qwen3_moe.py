@@ -250,6 +250,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 exceeds this threshold (variable K per token). If 1.0, behaves like explicit routed_tok.
           - Use full sort over experts to enable arbitrary rank selection and thresholding.
           - Keep original Qwen normalization flag (norm_topk_prob) semantics: renormalize only if True.
+
+        Layerwise Contrastive Routing (MVP, decode-only):
+          - Single-pass hidden-space contrast inside the MoE block to approximate strong-vs-weak
+            contrast without a second model pass. Triggered only during decode (seq_len==1) and only
+            when no explicit routing overrides are provided (to avoid interference).
+          - Entropy-gated using normalized entropy of the router distribution; when uncertain we
+            evaluate an additional weak expert set and combine: h_out = h_s + alpha * (h_s - h_w)
+            with alpha derived from BETA via norm matching for stability.
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
@@ -257,20 +265,105 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
-        # Softmax over experts
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-
-        # Full ranking (SCMoE: sort instead of fixed topk to enable routed_tok/threshold selection)
-        routing_weights, selected_experts = torch.sort(routing_weights, dim=-1, descending=True)
+        # Softmax over experts (fp32 for stability). Keep both unsorted and sorted variants.
+        probs_all = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.sort(probs_all, dim=-1, descending=True)
 
         # Defaults to preserve original behavior if caller doesn't pass SCMoE knobs
         if routed_tok is None:
-            routed_tok = list(range(self.top_k))
+            routed_tok_default = list(range(self.top_k))
+        else:
+            routed_tok_default = routed_tok
         if num_experts_per_tok is None:
             num_experts_per_tok = self.top_k
 
+        # -------------------------------
+        # Layerwise Contrastive Routing
+        # -------------------------------
+        # Hardcoded MVP constants (no CLI/config exposure for now)
+        LC_ENABLED = True
+        ENTROPY_TAU = 0.50
+        BETA = 0.50
+        WEAK_K = 1
+        FORCE_DISTINCT = True
+        NORM_MATCH = True
+        EPS = 1e-6
+
+        # Preconditions for LC: enabled, decode-only (seq_len==1), and no explicit routing/threshold override
+        lc_can_run = (
+            LC_ENABLED
+            and sequence_length == 1
+            and routed_tok is None
+            and (dynamic_expert_routing_threshold is None or dynamic_expert_routing_threshold == 1.0)
+        )
+
+        if lc_can_run:
+            # Normalized entropy H in [0,1] from the full router distribution (before sorting)
+            # H = -sum p log p / log(E)
+            with torch.autocast(device_type=hidden_states.device.type if isinstance(hidden_states.device.type, str) else "cpu", enabled=False):
+                p = probs_all
+                loge = torch.log(torch.tensor(float(self.num_experts), device=p.device))
+                ent = -(p * (p.clamp_min(EPS)).log()).sum(dim=-1) / loge
+                # ent shape: (B*S,)
+
+            # Strong set (top-K_s)
+            Ks = num_experts_per_tok
+            strong_sel = selected_experts[:, : Ks]
+            strong_w = routing_weights[:, : Ks]
+            if self.norm_topk_prob:
+                denom = strong_w.sum(dim=-1, keepdim=True).clamp_min(EPS)
+                strong_w = strong_w / denom
+
+            # Weak set: next K_w ranks after strong, optionally enforcing distinctness
+            off = Ks
+            weak_sel = selected_experts[:, off : off + WEAK_K]
+            if FORCE_DISTINCT and WEAK_K > 0:
+                # Since we slice immediately after top-K, sets are distinct by construction
+                pass
+            weak_w = routing_weights[:, off : off + WEAK_K]
+            if self.norm_topk_prob and WEAK_K > 0:
+                denom_w = weak_w.sum(dim=-1, keepdim=True).clamp_min(EPS)
+                weak_w = weak_w / denom_w
+
+            # Helper to compute weighted expert outputs for current tokens and a given selection/weights
+            def _mix_experts(sel: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+                if sel.numel() == 0:
+                    return torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+                # One-hot mask over experts: [num_experts, K, B*S]
+                expert_mask = torch.nn.functional.one_hot(sel, num_classes=self.num_experts).permute(2, 1, 0)
+                mixed = torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+                for expert_idx in range(self.num_experts):
+                    idx, top_x = torch.where(expert_mask[expert_idx])
+                    if top_x.shape[0] == 0:
+                        continue
+                    top_x_list = top_x.tolist()
+                    idx_list = idx.tolist()
+                    current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+                    contrib = self.experts[expert_idx](current_state) * w[top_x_list, idx_list, None]
+                    mixed.index_add_(0, top_x, contrib.to(hidden_states.dtype))
+                return mixed
+
+            h_s = _mix_experts(strong_sel, strong_w)
+            # If all confident (entropy < tau), skip weak path and return strong only
+            if torch.all(ent < ENTROPY_TAU) or WEAK_K == 0:
+                final_hidden_states = h_s
+            else:
+                h_w = _mix_experts(weak_sel, weak_w)
+                d = h_s - h_w
+                if NORM_MATCH:
+                    # alpha = BETA * ||h_s|| / (||d|| + EPS)
+                    hs_norm = torch.linalg.vector_norm(h_s, ord=2, dim=-1)
+                    d_norm = torch.linalg.vector_norm(d, ord=2, dim=-1)
+                    alpha = BETA * (hs_norm / (d_norm + EPS))
+                    final_hidden_states = h_s + alpha.unsqueeze(-1) * d
+                else:
+                    final_hidden_states = (1.0 + BETA) * h_s - BETA * h_w
+
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states, router_logits
+
         # (SCMoE ablation) routed_tok=[128] means: sample one random expert among 128 (append random column)
-        if len(routed_tok) == 1 and routed_tok[0] == 128:
+        if len(routed_tok_default) == 1 and routed_tok_default[0] == 128:
             routing_weights_random = torch.ones(routing_weights.shape[0], 1, device=routing_weights.device)
             routing_weights = torch.cat((routing_weights, routing_weights_random), dim=-1)
             # sample in [0, 128); if model has fewer than 128 experts, cap the range
@@ -282,7 +375,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if dynamic_expert_routing_threshold is not None and dynamic_expert_routing_threshold != 1.0:
             # Keep the smallest prefix of experts per token whose cumulative prob
             # exceeds the threshold, capped by num_experts_per_tok
-            dim_size = len(routed_tok)  # authors use routed_tok length as the maximum slice base
+            dim_size = len(routed_tok_default)  # authors use routed_tok length as the maximum slice base
             cumsum = torch.cumsum(routing_weights, dim=-1)
             threshold_indices = (cumsum > dynamic_expert_routing_threshold).sum(dim=-1)
 
@@ -307,8 +400,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 # selected_experts is already aligned
         else:
             # Explicit ranks path: pick expert ranks by routed_tok (e.g., [0], [0,1], [0,2], etc.)
-            routing_weights = routing_weights[:, routed_tok]
-            selected_experts = selected_experts[:, routed_tok]
+            routing_weights = routing_weights[:, routed_tok_default]
+            selected_experts = selected_experts[:, routed_tok_default]
 
         # Optional renormalization (Qwen-specific flag).
         # In Mixtral SCMoE they always renormalize; here we respect Qwen's norm_topk_prob.
