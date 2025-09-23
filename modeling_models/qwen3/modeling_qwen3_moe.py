@@ -283,11 +283,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # Hardcoded MVP constants (no CLI/config exposure for now)
         LC_ENABLED = True
         ENTROPY_TAU = 0.50
+        ENT_K = 32  # number of top experts to compute entropy over
         BETA = 0.50
         WEAK_K = 1
         FORCE_DISTINCT = True
         NORM_MATCH = True
         EPS = 1e-6
+        DEBUG_LC = True  # print lightweight debug info during decode
 
         # Preconditions for LC: enabled, decode-only (seq_len==1), and no explicit routing/threshold override
         lc_can_run = (
@@ -301,10 +303,33 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             # Normalized entropy H in [0,1] from the full router distribution (before sorting)
             # H = -sum p log p / log(E)
             with torch.autocast(device_type=hidden_states.device.type if isinstance(hidden_states.device.type, str) else "cpu", enabled=False):
-                p = probs_all
-                loge = torch.log(torch.tensor(float(self.num_experts), device=p.device))
-                ent = -(p * (p.clamp_min(EPS)).log()).sum(dim=-1) / loge
+                # Compute entropy over top-ENT_K sorted probabilities, renormalized to a simplex of size K
+                topn_ent = int(min(ENT_K, routing_weights.shape[1]))
+                p_top = routing_weights[:, : topn_ent]
+                p_top = p_top / p_top.sum(dim=-1, keepdim=True).clamp_min(EPS)
+                logk = torch.log(torch.tensor(float(topn_ent), device=p_top.device))
+                ent = -(p_top * (p_top.clamp_min(EPS)).log()).sum(dim=-1) / logk
                 # ent shape: (B*S,)
+            if DEBUG_LC:
+                try:
+                    vals = ent.detach().to(torch.float32).cpu().tolist()
+                    if len(vals) <= 16:
+                        s = ", ".join(f"{v:.4f}" for v in vals)
+                        print(f"[LC] entropy H per seq: [{s}]  tau={ENTROPY_TAU} k={topn_ent}")
+                    else:
+                        print(
+                            f"[LC] entropy H stats: mean={ent.mean().item():.4f} min={ent.min().item():.4f} max={ent.max().item():.4f}  tau={ENTROPY_TAU} k={topn_ent}"
+                        )
+                    # Also show top-20 expert probabilities (sorted) for the first rows
+                    topn = int(min(20, routing_weights.shape[1]))
+                    rows = int(min(2, routing_weights.shape[0]))
+                    for r in range(rows):
+                        top_idx = selected_experts[r, : topn].detach().to(torch.int).cpu().tolist()
+                        top_prob = routing_weights[r, : topn].detach().to(torch.float32).cpu().tolist()
+                        pairs = ", ".join(f"{i}:{p:.4f}" for i, p in zip(top_idx, top_prob))
+                        print(f"[LC] top{topn} experts (row {r}): {pairs}")
+                except Exception:
+                    pass
 
             # Strong set (top-K_s)
             Ks = num_experts_per_tok
@@ -345,7 +370,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
             h_s = _mix_experts(strong_sel, strong_w)
             # If all confident (entropy < tau), skip weak path and return strong only
-            if torch.all(ent < ENTROPY_TAU) or WEAK_K == 0:
+            all_confident = torch.all(ent < ENTROPY_TAU)
+            if DEBUG_LC:
+                try:
+                    apply_weak = (not bool(all_confident)) and (WEAK_K > 0)
+                    print(f"[LC] apply_weak={apply_weak}  Ks={Ks} weak_k={WEAK_K} norm_match={NORM_MATCH}")
+                except Exception:
+                    pass
+            if all_confident or WEAK_K == 0:
                 final_hidden_states = h_s
             else:
                 h_w = _mix_experts(weak_sel, weak_w)

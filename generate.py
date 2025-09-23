@@ -412,6 +412,25 @@ def generate(rank, args):
                 top_k=args.cs_k,
                 stopping_criteria=stopping_criteria,
             )
+        if args.decoding_method == "onepass":
+            # One-pass layerwise contrast lives inside the model's MoE block.
+            # Ensure no routing overrides block the internal LC path.
+            try:
+                if hasattr(model, "config"):
+                    if hasattr(model.config, "routed_tok"):
+                        model.config.routed_tok = None
+                    if hasattr(model.config, "dynamic_expert_routing_threshold"):
+                        model.config.dynamic_expert_routing_threshold = None
+            except Exception:
+                pass
+
+            outputs = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,
+                stopping_criteria=stopping_criteria,
+            )
         if args.decoding_method == "dola":
             early_exit_layers = [int(x) for x in args.dola_early_exit_layers.split(",")]
             outputs = dola(
