@@ -413,23 +413,24 @@ def generate(rank, args):
                 stopping_criteria=stopping_criteria,
             )
         if args.decoding_method == "onepass":
-            # One-pass layerwise contrast lives inside the model's MoE block.
-            # Ensure no routing overrides block the internal LC path.
+            # Enable LC flag on the model for persistence
             try:
-                if hasattr(model, "config"):
-                    if hasattr(model.config, "routed_tok"):
-                        model.config.routed_tok = None
-                    if hasattr(model.config, "dynamic_expert_routing_threshold"):
-                        model.config.dynamic_expert_routing_threshold = None
+                setattr(model, "use_onepass_lc", True)
             except Exception:
                 pass
 
-            outputs = model.generate(
+            # Use custom single-pass greedy loop to call model(...) directly with the flag
+            from decodingmethod.moe_utils import onepass_greedy
+            outputs = onepass_greedy(
+                model,
+                tokenizer,
                 input_ids,
-                attention_mask=attention_mask,
+                attention_mask,
                 max_new_tokens=args.max_new_tokens,
-                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                early_stop=args.early_stop,
                 stopping_criteria=stopping_criteria,
+                use_onepass_lc=True,
             )
         if args.decoding_method == "dola":
             early_exit_layers = [int(x) for x in args.dola_early_exit_layers.split(",")]

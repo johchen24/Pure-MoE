@@ -946,6 +946,8 @@ class MixtralSparseMoeBlock(nn.Module):
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[List] = None,
         dynamic_expert_routing_threshold: Optional[float] = None,
+        enable_layerwise_contrast: Optional[bool] = None,
+        use_onepass_lc: Optional[bool] = None,
     ) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -953,8 +955,90 @@ class MixtralSparseMoeBlock(nn.Module):
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.sort(routing_weights, dim=-1, descending=True)
+        probs_all = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.sort(probs_all, dim=-1, descending=True)
+
+        # -------------------------------
+        # Layerwise Contrastive Routing (decode-only, one-pass)
+        # -------------------------------
+        # Strong = top-Ks (Ks defaults to top_k); Weak = rank-Kw (default 3)
+        # Apply only when decoding a single token, no explicit routing overrides, and layer is enabled
+        BETA = 0.50
+        WEAK_RANK = 3  # 1-based rank → rank-3 means index 2
+        EPS = 1e-6
+        ENTROPY_TAU = 0.85
+        DEBUG_LC = True
+        lc_can_run = (
+            (enable_layerwise_contrast is None or enable_layerwise_contrast)
+            and (use_onepass_lc is True)
+            and sequence_length == 1
+        )
+
+        if lc_can_run:
+            Ks = num_experts_per_tok if num_experts_per_tok is not None else self.top_k
+
+            # Strong set: top-Ks
+            strong_sel = selected_experts[:, : Ks]
+            strong_w = routing_weights[:, : Ks]
+            strong_w = strong_w / strong_w.sum(dim=-1, keepdim=True).clamp_min(EPS)
+
+            # Entropy over all experts (normalized by log(E))
+            loge = torch.log(torch.tensor(float(self.num_experts), device=probs_all.device))
+            ent = -(probs_all * probs_all.clamp_min(EPS).log()).sum(dim=-1) / loge
+
+            # Debug: show per-expert probabilities (all 8) and entropy for first rows
+            if DEBUG_LC:
+                try:
+                    rows = int(min(2, probs_all.shape[0]))
+                    for r in range(rows):
+                        p_list = probs_all[r, :].detach().to(torch.float32).cpu().tolist()
+                        prob_str = ", ".join(f"{i}:{p:.4f}" for i, p in enumerate(p_list))
+                        print(f"[LC-Mixtral] row {r} ent={ent[r].item():.4f} tau={ENTROPY_TAU} probs: {prob_str}")
+                except Exception:
+                    pass
+
+            # Weak set: rank-WEAK_RANK (single expert)
+            start = max(0, WEAK_RANK - 1)
+            end = start + 1
+            weak_sel = selected_experts[:, start: end]
+            weak_w = routing_weights[:, start: end]
+            # Decide gating by entropy (batch-wide): if all tokens are confident, skip weak
+            all_confident = torch.all(ent < ENTROPY_TAU)
+
+            # Helper: mix a given selection with weights into a single hidden vector per token
+            def _mix_experts(sel: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+                if sel.numel() == 0:
+                    return torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+                expert_mask = torch.nn.functional.one_hot(
+                    sel, num_classes=self.num_experts
+                ).permute(2, 1, 0)
+                mixed = torch.zeros((batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device)
+                for expert_idx in range(self.num_experts):
+                    expert_layer = self.experts[expert_idx]
+                    idx, top_x = torch.where(expert_mask[expert_idx])
+                    if top_x.shape[0] == 0:
+                        continue
+                    top_x_list = top_x.tolist()
+                    idx_list = idx.tolist()
+                    current_state = hidden_states[None, top_x_list].reshape(-1, hidden_dim)
+                    contrib = expert_layer(current_state) * w[top_x_list, idx_list, None]
+                    mixed.index_add_(0, top_x, contrib.to(hidden_states.dtype))
+                return mixed
+
+            h_s = _mix_experts(strong_sel, strong_w)
+            # If confident or weak set missing, return strong only
+            if all_confident or weak_sel.numel() == 0:
+                final_hidden_states = h_s
+            else:
+                weak_w = weak_w / weak_w.sum(dim=-1, keepdim=True).clamp_min(EPS)
+                h_w = _mix_experts(weak_sel, weak_w)
+                d = h_s - h_w
+                hs_norm = torch.linalg.vector_norm(h_s, ord=2, dim=-1)
+                d_norm = torch.linalg.vector_norm(d, ord=2, dim=-1)
+                alpha = BETA * (hs_norm / (d_norm + EPS))
+                final_hidden_states = h_s + alpha.unsqueeze(-1) * d
+            final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+            return final_hidden_states, router_logits
         if len(routed_tok) == 1 and routed_tok[0] == 8:
             routing_weights_random = torch.ones(routing_weights.shape[0], 1).to(routing_weights.device)
             routing_weights = torch.cat((routing_weights, routing_weights_random), dim=-1)
@@ -1102,7 +1186,12 @@ class MixtralDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states, router_logits = self.block_sparse_moe(
-            hidden_states, kwargs.get("num_experts_per_tok"), kwargs.get("routed_tok"), kwargs.get("dynamic_expert_routing_threshold")
+            hidden_states,
+            kwargs.get("num_experts_per_tok"),
+            kwargs.get("routed_tok"),
+            kwargs.get("dynamic_expert_routing_threshold"),
+            kwargs.get("enable_layerwise_contrast"),
+            kwargs.get("use_onepass_lc"),
         )
         hidden_states = residual + hidden_states
 
@@ -1288,6 +1377,7 @@ class MixtralModel(MixtralPreTrainedModel):
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[List] = None,
         dynamic_expert_routing_threshold: Optional[float] = None,
+        use_onepass_lc: Optional[bool] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1428,6 +1518,8 @@ class MixtralModel(MixtralPreTrainedModel):
                     num_experts_per_tok=num_experts_per_tok,
                     routed_tok=routed_tok,
                     dynamic_expert_routing_threshold=dynamic_expert_routing_threshold,
+                    enable_layerwise_contrast=(decoder_layer.self_attn.layer_idx >= (self.config.num_hidden_layers // 2)),
+                    use_onepass_lc=kwargs.get("use_onepass_lc"),
                 )
 
             hidden_states = layer_outputs[0]
@@ -1530,6 +1622,7 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[List] = None,
         dynamic_expert_routing_threshold: Optional[float] = None,
+        use_onepass_lc: Optional[bool] = None,
     ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
         r"""
         Args:
@@ -1592,6 +1685,7 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
             num_experts_per_tok=num_experts_per_tok if num_experts_per_tok else self.config.num_experts_per_tok,
             routed_tok=routed_tok if routed_tok else self.config.routed_tok,
             dynamic_expert_routing_threshold=dynamic_expert_routing_threshold if dynamic_expert_routing_threshold else self.config.dynamic_expert_routing_threshold,
+            use_onepass_lc=use_onepass_lc,
         )
 
         hidden_states = outputs[0]
@@ -1703,6 +1797,7 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "output_router_logits": output_router_logits,
+                "use_onepass_lc": getattr(self, "use_onepass_lc", False),
             }
         )
         return model_inputs

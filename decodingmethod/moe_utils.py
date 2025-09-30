@@ -314,3 +314,89 @@ def scmoe_with_sampling(
             is_encoder_decoder=model.config.is_encoder_decoder,
         )
     return input_ids
+
+
+@torch.no_grad()
+def onepass_greedy(
+    model,
+    tokenizer,
+    input_ids,
+    attention_mask,
+    max_new_tokens,
+    eos_token_id=None,
+    early_stop=False,
+    stopping_criteria=None,
+    use_onepass_lc: bool = True,
+):
+    """
+    Single-pass greedy decoding loop that calls model(...) directly each step,
+    passing use_onepass_lc to enable layerwise contrast inside the model.
+
+    Notes
+    - Uses HF caching utilities to mirror generate() semantics.
+    - Works for Mixtral (LC-enabled) and is a no-op flag for other models.
+    """
+    batch_size, prefix_len = input_ids.size()
+
+    # Prepare model kwargs and cache positions for first step
+    model_kwargs = {"attention_mask": attention_mask, "use_cache": True}
+    try:
+        model_kwargs = model._prepare_model_kwargs_for_generation(input_ids, model_kwargs)
+    except AttributeError:
+        seq_len = input_ids.shape[-1]
+        model_kwargs["cache_position"] = torch.arange(seq_len, device=input_ids.device, dtype=torch.long)
+
+    eos_token_id = eos_token_id if eos_token_id is not None else getattr(tokenizer, "eos_token_id", None)
+    eos_token_id_tensor = (
+        torch.tensor([eos_token_id], device=input_ids.device) if eos_token_id is not None else None
+    )
+    unfinished_sequences = input_ids.new(batch_size).fill_(1)
+    stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+
+    for step in range(max_new_tokens):
+        model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
+        # Ensure flag persists even if prepare_inputs doesn't copy it through
+        model_inputs["use_onepass_lc"] = use_onepass_lc
+
+        outputs = model(
+            **model_inputs,
+            return_dict=True,
+            output_hidden_states=False,
+        )
+
+        next_token_scores = outputs.logits[:, -1, :]
+        # Greedy
+        next_tokens = torch.argmax(next_token_scores, dim=-1)
+
+        # Respect EOS handling
+        if not early_stop and eos_token_id is not None:
+            # prevent picking EOS unless criteria say stop
+            pass  # greedy picking already done; rely on criteria to stop
+
+        # Mask out finished sequences with pad
+        pad_id = getattr(tokenizer, "pad_token_id", eos_token_id if eos_token_id is not None else 0)
+        next_tokens = next_tokens * unfinished_sequences + pad_id * (1 - unfinished_sequences)
+
+        input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+
+        if eos_token_id_tensor is not None:
+            unfinished_sequences = unfinished_sequences.mul(
+                next_tokens.tile(eos_token_id_tensor.shape[0], 1)
+                .ne(eos_token_id_tensor.unsqueeze(1))
+                .prod(dim=0)
+            )
+
+        # External stopping criteria
+        stop_now = stopping_criteria(input_ids, None)
+        unfinished_sequences = unfinished_sequences & ~stop_now
+        if unfinished_sequences.max() == 0 or step == max_new_tokens - 1:
+            break
+
+        # Update caches
+        model_kwargs = model._update_model_kwargs_for_generation(
+            outputs,
+            model_kwargs,
+            is_encoder_decoder=model.config.is_encoder_decoder,
+        )
+
+    return input_ids

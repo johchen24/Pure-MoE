@@ -240,6 +240,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[list[int]] = None,
         dynamic_expert_routing_threshold: Optional[float] = None,
+        enable_layerwise_contrast: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         SCMoE changes:
@@ -282,8 +283,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # -------------------------------
         # Hardcoded MVP constants (no CLI/config exposure for now)
         LC_ENABLED = True
-        ENTROPY_TAU = 0.50
-        ENT_K = 32  # number of top experts to compute entropy over
+        ENTROPY_TAU = 0.85
         BETA = 0.50
         WEAK_K = 1
         FORCE_DISTINCT = True
@@ -297,28 +297,27 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and sequence_length == 1
             and routed_tok is None
             and (dynamic_expert_routing_threshold is None or dynamic_expert_routing_threshold == 1.0)
+            and (enable_layerwise_contrast is None or enable_layerwise_contrast)
         )
 
         if lc_can_run:
             # Normalized entropy H in [0,1] from the full router distribution (before sorting)
             # H = -sum p log p / log(E)
             with torch.autocast(device_type=hidden_states.device.type if isinstance(hidden_states.device.type, str) else "cpu", enabled=False):
-                # Compute entropy over top-ENT_K sorted probabilities, renormalized to a simplex of size K
-                topn_ent = int(min(ENT_K, routing_weights.shape[1]))
-                p_top = routing_weights[:, : topn_ent]
-                p_top = p_top / p_top.sum(dim=-1, keepdim=True).clamp_min(EPS)
-                logk = torch.log(torch.tensor(float(topn_ent), device=p_top.device))
-                ent = -(p_top * (p_top.clamp_min(EPS)).log()).sum(dim=-1) / logk
+                # Compute normalized entropy over all experts
+                p = probs_all
+                loge = torch.log(torch.tensor(float(self.num_experts), device=p.device))
+                ent = -(p * (p.clamp_min(EPS)).log()).sum(dim=-1) / loge
                 # ent shape: (B*S,)
             if DEBUG_LC:
                 try:
                     vals = ent.detach().to(torch.float32).cpu().tolist()
                     if len(vals) <= 16:
                         s = ", ".join(f"{v:.4f}" for v in vals)
-                        print(f"[LC] entropy H per seq: [{s}]  tau={ENTROPY_TAU} k={topn_ent}")
+                        print(f"[LC] entropy H per seq: [{s}]  tau={ENTROPY_TAU}")
                     else:
                         print(
-                            f"[LC] entropy H stats: mean={ent.mean().item():.4f} min={ent.min().item():.4f} max={ent.max().item():.4f}  tau={ENTROPY_TAU} k={topn_ent}"
+                            f"[LC] entropy H stats: mean={ent.mean().item():.4f} min={ent.min().item():.4f} max={ent.max().item():.4f}  tau={ENTROPY_TAU}"
                         )
                     # Also show top-20 expert probabilities (sorted) for the first rows
                     topn = int(min(20, routing_weights.shape[1]))
@@ -584,6 +583,7 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
                 kwargs.get("num_experts_per_tok"),
                 kwargs.get("routed_tok"),
                 kwargs.get("dynamic_expert_routing_threshold"),
+                kwargs.get("enable_layerwise_contrast"),
             )
         else:
             hidden_states = self.mlp(hidden_states)
@@ -724,6 +724,8 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            # Enable LC only on second half of layers
+            enable_lc = decoder_layer.layer_idx >= (self.config.num_hidden_layers // 2)
             hidden_states = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -736,6 +738,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 num_experts_per_tok=num_experts_per_tok,
                 routed_tok=routed_tok,
                 dynamic_expert_routing_threshold=dynamic_expert_routing_threshold,
+                enable_layerwise_contrast=enable_lc,
                 # -------------------------------------------------------------------------
                 **kwargs,   # keep passing attention / backend kwargs unchanged
             )
