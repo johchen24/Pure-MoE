@@ -178,8 +178,8 @@ class GptOssMLP(nn.Module):
         router_scores, router_indices = self.router(hidden_states)
         
         # Constants for weight-space contrast
-        BETA = 0.5              # Contrast strength
-        WEAK_RANK = 4           # 1-based rank → index 3
+        BETA = 0.3              # Contrast strength
+        WEAK_RANK = 5           # 1-based rank → index 3
         EPS = 1e-6              # Numerical stability
         ENTROPY_TAU = 0.85      # Entropy threshold (normalized [0,1])
         DEBUG_LC = True         # Enable debug prints
@@ -217,6 +217,8 @@ class GptOssMLP(nn.Module):
             use_contrast = torch.any(entropy >= ENTROPY_TAU)
             
             if use_contrast:
+                # Note: Layer index info not available at MLP level, but we know contrast
+                # is only enabled for layers >= num_hidden_layers // 2 (see GptOssModel.forward)
                 print(f"[GPT-OSS WS-Contrast] Applying weight-space contrast (entropy={entropy.mean().item():.4f} >= {ENTROPY_TAU})")
                 
                 # Get top-K experts for weighted averaging
@@ -604,7 +606,7 @@ class GptOssModel(GptOssPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,
@@ -653,6 +655,12 @@ class GptOssModel(GptOssPreTrainedModel):
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers:
+            # Only enable weight-space contrast for second half of layers
+            # (early layers learn general features, later layers do reasoning)
+            enable_contrast = (
+                use_onepass_lc 
+                and decoder_layer.self_attn.layer_idx >= (self.config.num_hidden_layers // 2)
+            )
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -661,7 +669,7 @@ class GptOssModel(GptOssPreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
-                use_onepass_lc=use_onepass_lc,
+                use_onepass_lc=enable_contrast,
                 **kwargs,
             )
         hidden_states = self.norm(hidden_states)

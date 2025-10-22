@@ -237,6 +237,16 @@ def generate(rank, args):
         config=config,
         attn_implementation="flash_attention_2"
     ).eval()
+    
+    # Log GPT-OSS specific requirements
+    if "gpt" in args.model_name_or_path.lower() and "oss" in args.model_name_or_path.lower():
+        if rank == 0:
+            print("="*80)
+            print("GPT-OSS MODEL DETECTED")
+            print("Harmony chat template will be applied with system message: 'Reasoning: medium'")
+            print("Source: https://huggingface.co/openai/gpt-oss-20b")
+            print("Note: GPT-OSS models REQUIRE harmony format to work correctly")
+            print("="*80)
 
     if args.decoding_method == "cd":
         config = AutoConfig.from_pretrained(
@@ -339,6 +349,12 @@ def generate(rank, args):
                 stopping_criteria.append(
                     StopAtSpecificTokenCriteria(token_id_list=[[13, 13]])
                 )
+        elif "gpt" in args.model_name_or_path.lower() and "oss" in args.model_name_or_path.lower():
+            # GPT-OSS uses harmony format with special tokens:
+            # <|return|> (200002) and <|endoftext|> (199999) for EOS
+            # The model naturally generates <|return|> when using chat template
+            # Let EOS token handling work naturally - no explicit stopping criteria needed
+            pass
         elif "Qwen3" in args.model_name_or_path or "qwen3" in args.model_name_or_path:
             if "mbpp" in args.infile:
                 #   '[DONE]' -> [64920, 5225, 60]
@@ -368,7 +384,41 @@ def generate(rank, args):
         if start % 20 == 0 and rank == 0:
             print(f"rank {rank} has generated {start} prompts")
         cur_prompt_lst = prompt_lst[start : start + args.batch_size]
-        prompt_text = [f"{x['instructions']}" for x in cur_prompt_lst]
+        
+        # GPT-OSS models REQUIRE harmony chat template format
+        # Source: https://huggingface.co/openai/gpt-oss-20b
+        # "Both models were trained on our harmony response format and should only be 
+        # used with the harmony format as it will not work correctly otherwise."
+        # The reasoning level is set in the system prompt (e.g., "Reasoning: medium")
+        if "gpt" in args.model_name_or_path.lower() and "oss" in args.model_name_or_path.lower():
+            # Apply harmony chat template with reasoning level in system message
+            prompt_text = []
+            for idx, x in enumerate(cur_prompt_lst):
+                # Set reasoning level in system message as per Hugging Face docs
+                messages = [
+                    {"role": "system", "content": "Reasoning: medium, YOU MUST CLEARLY END YOUR RESPONSE WITH EITHER \'The answer is yes\' or \'The answer is no\', no other response is acceptable"},
+                    {"role": "user", "content": x['instructions']}
+                ]
+                
+                # Apply chat template
+                formatted = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                prompt_text.append(formatted)
+                
+                # Debug: Show first formatted prompt to verify harmony format
+                if start == 0 and idx == 0 and rank == 0:
+                    print("\n" + "="*80)
+                    print("GPT-OSS HARMONY FORMAT (first prompt):")
+                    print("="*80)
+                    print(formatted[:800] + "..." if len(formatted) > 800 else formatted)
+                    print("="*80 + "\n")
+        else:
+            # For non-GPT-OSS models, use raw text
+            prompt_text = [f"{x['instructions']}" for x in cur_prompt_lst]
+        
         model_inputs = tokenizer(
             prompt_text, padding=True, add_special_tokens=True, return_tensors="pt"
         )
