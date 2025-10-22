@@ -141,18 +141,21 @@ def scmoe(
             
             # Apply dynamic beta in contrastive formula
             diffs = (1 + beta_dynamic) * next_token_scores - beta_dynamic * next_token_logits_student
-            
-            # Optional: Print debug info (remove in production)
-            if step < 20:  # Only print first few decoding steps
-                vals = beta_dynamic.squeeze(-1).detach().cpu().tolist()
-                if len(vals) <= 8:
-                    s = ", ".join(f"{v:.4f}" for v in vals)
-                    print(f"Step {step}: beta=[{s}]")
-                else:
-                    print(f"Step {step}: beta_mean={beta_dynamic.mean().item():.4f}")
         else:
             # Use fixed beta (original SCMoE behavior)
             diffs = (1 + beta) * next_token_scores - beta * next_token_logits_student
+        
+        # Calculate and print Shannon entropy of teacher distribution
+        teacher_probs = F.softmax(next_token_scores, dim=-1)
+        eps = 1e-9
+        vocab_size = teacher_probs.shape[-1]
+        log_vocab_size = torch.log(torch.tensor(float(vocab_size), device=teacher_probs.device))
+        # Normalized entropy in [0, 1] range
+        entropy = -(teacher_probs * teacher_probs.clamp_min(eps).log()).sum(dim=-1) / log_vocab_size
+        
+        # Print entropy for each sample in batch
+        for i in range(batch_size):
+            print(f"Step {step} Sample {i}: entropy={entropy[i].item():.4f}")
             
         cdlogits = diffs.masked_fill(next_token_scores < cutoff, -float("inf"))
         if not early_stop and eos_token_id != None:
@@ -171,23 +174,9 @@ def scmoe(
                 .prod(dim=0)
             )
 
-        # ORIGINAL:
-        # unfinished_sequences = unfinished_sequences & ~stopping_criteria(
-        #     input_ids, None
-        # )
-
-        sc_met = stopping_criteria(input_ids, None)
-        # DEBUG: print at every step – last 10 token ids and recent decoded chunk
-        try:
-            all_tail_ids = input_ids[0, prefix_len:].detach().cpu().tolist()
-            last10_ids = all_tail_ids[-10:]
-            recent_chunk_ids = all_tail_ids[-50:]
-            recent_text = tokenizer.decode(recent_chunk_ids, skip_special_tokens=False)
-            print(f"[SCMOE-DBG] step={step} gen_len={len(all_tail_ids)} stop={bool(sc_met)} last10_ids={last10_ids} recent_text={recent_text}")
-        except Exception as _e:
-            print(f"[SCMOE-DBG] decode failed: {_e}")
-
-        unfinished_sequences = unfinished_sequences & ~sc_met
+        unfinished_sequences = unfinished_sequences & ~stopping_criteria(
+            input_ids, None
+        )
         
         
         if unfinished_sequences.max() == 0 or step == max_new_tokens - 1:
