@@ -39,9 +39,10 @@ Implemented conditional weight-space contrast for GPT-OSS MoE model, creating sy
 - Extracts `use_onepass_lc` from kwargs
 - Passes flag to MLP layer
 
-#### Modified `GptOssModel.forward()` (Lines 618, 664)
+#### Modified `GptOssModel.forward()` (Lines 618, 655-672)
 - Added `use_onepass_lc` parameter
-- Passes flag to all decoder layers
+- **Layer-wise gating**: Only enables contrast for second half of layers (layers >= num_hidden_layers // 2)
+- Rationale: Early layers learn general features, later layers handle reasoning
 
 #### Modified `GptOssForCausalLM.forward()` (Lines 788, 828)
 - Added `use_onepass_lc` parameter
@@ -54,8 +55,19 @@ Implemented conditional weight-space contrast for GPT-OSS MoE model, creating sy
 - No changes needed
 
 #### `generate.py`
-- **Already implemented**: `--decoding_method onepass` triggers `onepass_greedy()` (lines 415-434)
-- No changes needed
+**Modified for GPT-OSS Harmony Format Support** (Lines 241-249, 342-347, 388-417):
+- **Detection**: Automatically detects GPT-OSS models by checking model path for "gpt" and "oss"
+- **Harmony Chat Template** (Lines 388-417):
+  - Applies `tokenizer.apply_chat_template()` with reasoning level set in **system message**: `"Reasoning: medium"`
+  - Required per [GPT-OSS model card](https://huggingface.co/openai/gpt-oss-20b): "must only be used with the harmony format"
+  - Reasoning level is set as system message content, not as a parameter (per Hugging Face documentation)
+  - Shows first formatted prompt for verification
+- **Stopping Criteria** (Lines 342-347):
+  - Relies on model's natural EOS tokens (`<|return|>` and `<|endoftext|>`)
+  - No explicit stopping criteria needed for GPT-OSS
+- **Logging** (Lines 241-249):
+  - Prints notification when GPT-OSS is detected
+  - Confirms harmony format will be applied with reasoning level
 
 ## Constants (Hardcoded)
 
@@ -78,6 +90,13 @@ python generate.py \
     --batch_size 1 \
     --max_new_tokens 256
 ```
+
+**Important for GPT-OSS Models:**
+- The script automatically detects GPT-OSS models (checks for "gpt" and "oss" in model path)
+- Harmony chat template is applied automatically with system message `"Reasoning: medium"` (hardcoded)
+- Reasoning level is set as system message content, per Hugging Face documentation
+- No additional flags needed - it just works!
+- First prompt will be printed to verify harmony format is applied correctly
 
 ## Debug Output
 
@@ -105,6 +124,6 @@ When entropy >= threshold, prints:
 
 - Implementation follows SCMoE paper principles (https://arxiv.org/html/2405.14507v2)
 - Norm preservation prevents activation explosion
-- Applied to all layers (can be modified for layer-wise gating)
+- **Layer-wise gating**: Contrast applied only to second half of layers (improves coherence)
 - Designed for batch_size=1 autoregressive generation
 

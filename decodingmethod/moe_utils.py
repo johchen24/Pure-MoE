@@ -65,8 +65,17 @@ def scmoe(
     student_routed_tok=[0],
     student_num_experts_per_tok=1,
     dynamic_beta=False,
+    entropy_threshold=0.1,
 ):
-
+    """
+    SCMoE decoding with optional entropy-based conditional contrast.
+    
+    Args:
+        entropy_threshold: Entropy threshold for conditional contrast.
+            - If None: Always run weak model and apply contrast (original SCMoE)
+            - If float: Only apply contrast when entropy > threshold
+            Default is 0.1 for entropy-based conditional contrast.
+    """
     batch_size, prefix_len = input_ids.size()
     # Prepare generation kwargs with cache_position for new HF caching API
     model_kwargs = {"attention_mask": attention_mask, "use_cache": True}
@@ -103,61 +112,76 @@ def scmoe(
         )
         next_token_scores = outputs.logits[:, -1, :]
         next_token_scores = next_token_scores / teacher_t
-        cutoff = (
-            torch.log(torch.tensor(alpha, device=next_token_scores.device))
-            + next_token_scores.max(dim=-1, keepdim=True).values
-        )
-
-        model_inputs_student = model.prepare_inputs_for_generation(
-            input_ids, **model_kwargs_student
-        )
-        outputs_student = model(
-            **model_inputs_student,
-            return_dict=True,
-            output_hidden_states=False,
-            routed_tok=student_routed_tok,
-            num_experts_per_tok=student_num_experts_per_tok,
-        )
-        next_token_logits_student = outputs_student.logits[:, -1, :]
-        next_token_logits_student = next_token_logits_student / student_t
-        # Dynamic beta scaling based on JSD between teacher and student distributions
-        if dynamic_beta:
-            # Convert logits to probabilities for JSD calculation
-            teacher_probs = F.softmax(next_token_scores, dim=-1)
-            student_probs = F.softmax(next_token_logits_student, dim=-1)
-            
-            # Calculate Jensen-Shannon Divergence
-            jsd_score = calculate_jsd(teacher_probs, student_probs)
-            
-            # Use raw JSD as beta (natural logs → beta in [0, ln 2]) with a lower bound.
-            # Rationale: avoid under-contrasting on very low-conflict yet error-prone steps.
-            beta_min_threshold = 0.25  # TODO: expose via CLI if helpful
-            beta_scalar = torch.maximum(
-                jsd_score,
-                torch.as_tensor(beta_min_threshold, device=jsd_score.device, dtype=jsd_score.dtype),
-            )
-            # Broadcast beta over vocab dimension once.
-            beta_dynamic = beta_scalar.unsqueeze(-1)
-            
-            # Apply dynamic beta in contrastive formula
-            diffs = (1 + beta_dynamic) * next_token_scores - beta_dynamic * next_token_logits_student
-        else:
-            # Use fixed beta (original SCMoE behavior)
-            diffs = (1 + beta) * next_token_scores - beta * next_token_logits_student
         
-        # Calculate and print Shannon entropy of teacher distribution
+        # Calculate Shannon entropy of teacher (strong expert) distribution
         teacher_probs = F.softmax(next_token_scores, dim=-1)
-        eps = 1e-9
         vocab_size = teacher_probs.shape[-1]
+        eps = 1e-9
         log_vocab_size = torch.log(torch.tensor(float(vocab_size), device=teacher_probs.device))
-        # Normalized entropy in [0, 1] range
+        # Normalized Shannon entropy: H(P) / log(V) ∈ [0, 1]
         entropy = -(teacher_probs * teacher_probs.clamp_min(eps).log()).sum(dim=-1) / log_vocab_size
         
-        # Print entropy for each sample in batch
-        for i in range(batch_size):
-            print(f"Step {step} Sample {i}: entropy={entropy[i].item():.4f}")
+        # Print entropy for each sample in the batch
+        for sample_idx in range(entropy.shape[0]):
+            print(f"Step {step} Sample {sample_idx}: entropy={entropy[sample_idx].item():.4f}")
+        
+        # Conditional contrast: only apply contrast when entropy > threshold
+        # When strong model is confident (low entropy), use greedy decoding directly
+        # If entropy_threshold is None, always apply contrast (original SCMoE behavior)
+        if entropy_threshold is None:
+            needs_contrast = True
+        else:
+            # Check if any sample needs contrast (entropy > threshold)
+            needs_contrast = (entropy > entropy_threshold).any()
+        
+        if needs_contrast:
+            # Run weak model for contrast
+            model_inputs_student = model.prepare_inputs_for_generation(
+                input_ids, **model_kwargs_student
+            )
+            outputs_student = model(
+                **model_inputs_student,
+                return_dict=True,
+                output_hidden_states=False,
+                routed_tok=student_routed_tok,
+                num_experts_per_tok=student_num_experts_per_tok,
+            )
+            next_token_logits_student = outputs_student.logits[:, -1, :]
+            next_token_logits_student = next_token_logits_student / student_t
             
-        cdlogits = diffs.masked_fill(next_token_scores < cutoff, -float("inf"))
+            # Apply contrastive decoding formula
+            cutoff = (
+                torch.log(torch.tensor(alpha, device=next_token_scores.device))
+                + next_token_scores.max(dim=-1, keepdim=True).values
+            )
+            
+            # Dynamic beta scaling based on JSD between teacher and student distributions
+            if dynamic_beta:
+                # Calculate student probabilities for JSD calculation
+                student_probs = F.softmax(next_token_logits_student, dim=-1)
+                
+                # Calculate Jensen-Shannon Divergence
+                jsd_score = calculate_jsd(teacher_probs, student_probs)
+                
+                # Use raw JSD as beta (natural logs → beta in [0, ln 2]) with a lower bound
+                beta_min_threshold = 0.25
+                beta_scalar = torch.maximum(
+                    jsd_score,
+                    torch.as_tensor(beta_min_threshold, device=jsd_score.device, dtype=jsd_score.dtype),
+                )
+                # Broadcast beta over vocab dimension
+                beta_dynamic = beta_scalar.unsqueeze(-1)
+                
+                # Apply dynamic beta in contrastive formula
+                diffs = (1 + beta_dynamic) * next_token_scores - beta_dynamic * next_token_logits_student
+            else:
+                # Use fixed beta (original SCMoE behavior)
+                diffs = (1 + beta) * next_token_scores - beta * next_token_logits_student
+            
+            cdlogits = diffs.masked_fill(next_token_scores < cutoff, -float("inf"))
+        else:
+            # Strong model is confident, use greedy decoding (no contrast)
+            cdlogits = next_token_scores
         if not early_stop and eos_token_id != None:
             cdlogits[:, eos_token_id] = -float("inf")
 
@@ -192,11 +216,14 @@ def scmoe(
             model_kwargs,
             is_encoder_decoder=model.config.is_encoder_decoder,
         )
-        model_kwargs_student = model._update_model_kwargs_for_generation(
-            outputs_student,
-            model_kwargs_student,
-            is_encoder_decoder=model.config.is_encoder_decoder,
-        )
+        
+        # Only update student kwargs if we ran the student model
+        if needs_contrast:
+            model_kwargs_student = model._update_model_kwargs_for_generation(
+                outputs_student,
+                model_kwargs_student,
+                is_encoder_decoder=model.config.is_encoder_decoder,
+            )
     return input_ids
 
 @torch.no_grad()

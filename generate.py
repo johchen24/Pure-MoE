@@ -170,6 +170,12 @@ def args_parse():
     parser.add_argument("--cd_st", default=1.0, type=float, help="student temperature")
     
     parser.add_argument("--dynamic_beta", action="store_true")
+    parser.add_argument(
+        "--entropy_threshold",
+        default=0.1,
+        type=float,
+        help="Entropy threshold for conditional contrast. Set to -1 to disable (always contrast).",
+    )
 
     parser.add_argument("--dola_early_exit_layers", default="0,2,4,6,8,10,12,14,32", type=str)
     parser.add_argument("--dola_mature_layer", default=32, type=int)
@@ -548,6 +554,7 @@ def generate(rank, args):
                 teacher_num_experts_per_tok=args.num_experts_per_tok,
                 student_routed_tok=MoE_mapping_student[args.student_routed_tok],
                 student_num_experts_per_tok=args.student_num_experts_per_tok,
+                entropy_threshold=None if args.entropy_threshold < 0 else args.entropy_threshold,
             )
         if args.decoding_method == "scmoe_with_sampling":
             if args.routed_tok == 0:

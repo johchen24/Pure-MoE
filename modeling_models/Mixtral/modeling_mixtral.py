@@ -946,8 +946,6 @@ class MixtralSparseMoeBlock(nn.Module):
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[List] = None,
         dynamic_expert_routing_threshold: Optional[float] = None,
-        enable_layerwise_contrast: Optional[bool] = None,
-        use_onepass_lc: Optional[bool] = None,
     ) -> torch.Tensor:
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -958,122 +956,6 @@ class MixtralSparseMoeBlock(nn.Module):
         probs_all = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.sort(probs_all, dim=-1, descending=True)
 
-        # -------------------------------
-        # Weight-Space Contrastive Expert Synthesis
-        # -------------------------------
-        # Strong = average of top-Ks expert weights; Weak = rank-4 expert
-        # Synthesize expert: W_synth = W_strong - beta * W_weak
-        # Apply only when decoding a single token and entropy indicates uncertainty
-        BETA = 0.50
-        WEAK_RANK = 4  # 1-based rank → rank-4 means index 3
-        EPS = 1e-6
-        ENTROPY_TAU = 0.85
-        DEBUG_LC = True
-        lc_can_run = (
-            (enable_layerwise_contrast is None or enable_layerwise_contrast)
-            and (use_onepass_lc is True)
-            and sequence_length == 1
-        )
-
-        if lc_can_run:
-            Ks = num_experts_per_tok if num_experts_per_tok is not None else self.top_k
-
-            # Strong set: top-Ks expert indices
-            strong_sel = selected_experts[:, :Ks]  # [batch*seq, Ks]
-
-            # Entropy over all experts (normalized by log(E))
-            loge = torch.log(torch.tensor(float(self.num_experts), device=probs_all.device))
-            ent = -(probs_all * probs_all.clamp_min(EPS).log()).sum(dim=-1) / loge
-
-            # Debug: show per-expert probabilities and entropy for first rows
-            if DEBUG_LC:
-                try:
-                    rows = int(min(2, probs_all.shape[0]))
-                    for r in range(rows):
-                        p_list = probs_all[r, :].detach().to(torch.float32).cpu().tolist()
-                        prob_str = ", ".join(f"{i}:{p:.4f}" for i, p in enumerate(p_list))
-                        print(f"[WS-Contrast] row {r} ent={ent[r].item():.4f} tau={ENTROPY_TAU} probs: {prob_str}")
-                except Exception:
-                    pass
-
-            # Decide gating by entropy (batch-wide): if all tokens are confident, skip contrast
-            all_confident = torch.all(ent < ENTROPY_TAU)
-
-            if all_confident:
-                # Use standard routing - fall through to original code below
-                pass
-            else:
-                # Apply weight-space contrast
-                # Weak set: rank-4 expert (index 3)
-                weak_expert_idx = WEAK_RANK - 1  # 0-indexed
-                
-                # Create synthetic expert by weight combination
-                # W_synth = W_strong - beta * W_weak
-                # Note: Each expert has w1, w2, w3 (MixtralBlockSparseTop2MLP)
-                
-                final_hidden_states = torch.zeros(
-                    (batch_size * sequence_length, hidden_dim),
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-                
-                # Process each token separately (since they may have different strong sets)
-                for token_idx in range(batch_size * sequence_length):
-                    # Get strong expert indices for this token
-                    strong_expert_ids = strong_sel[token_idx].tolist()
-                    weak_expert_id = selected_experts[token_idx, weak_expert_idx].item()
-                    
-                    # Average the weights of strong experts
-                    # w1, w2, w3 are Linear layers
-                    w1_strong_avg = torch.stack([self.experts[eid].w1.weight for eid in strong_expert_ids]).mean(dim=0)
-                    w2_strong_avg = torch.stack([self.experts[eid].w2.weight for eid in strong_expert_ids]).mean(dim=0)
-                    w3_strong_avg = torch.stack([self.experts[eid].w3.weight for eid in strong_expert_ids]).mean(dim=0)
-                    
-                    # Get weak expert weights
-                    w1_weak = self.experts[weak_expert_id].w1.weight
-                    w2_weak = self.experts[weak_expert_id].w2.weight
-                    w3_weak = self.experts[weak_expert_id].w3.weight
-                    
-                    # Synthesize contrastive weights: W_synth = W_strong + beta * (W_strong - W_weak)
-                    # Move in the direction from weak to strong (amplify the difference)
-                    direction_w1 = w1_strong_avg - w1_weak
-                    direction_w2 = w2_strong_avg - w2_weak
-                    direction_w3 = w3_strong_avg - w3_weak
-                    
-                    # Compute raw contrastive weights
-                    w1_synth_raw = w1_strong_avg + BETA * direction_w1
-                    w2_synth_raw = w2_strong_avg + BETA * direction_w2
-                    w3_synth_raw = w3_strong_avg + BETA * direction_w3
-                    
-                    # Rescale to preserve Frobenius norm (keeps activation strength)
-                    # This ensures synthetic expert has same magnitude as strong expert
-                    w1_norm_ratio = torch.norm(w1_strong_avg) / (torch.norm(w1_synth_raw) + EPS)
-                    w2_norm_ratio = torch.norm(w2_strong_avg) / (torch.norm(w2_synth_raw) + EPS)
-                    w3_norm_ratio = torch.norm(w3_strong_avg) / (torch.norm(w3_synth_raw) + EPS)
-                    
-                    w1_synth = w1_synth_raw * w1_norm_ratio
-                    w2_synth = w2_synth_raw * w2_norm_ratio
-                    w3_synth = w3_synth_raw * w3_norm_ratio
-                    
-                    # Debug: Check weight statistics (first token only)
-                    if token_idx == 0 and DEBUG_LC:
-                        print(f"[Weight Stats] strong: norm={torch.norm(w1_strong_avg).item():.2f}, std={w1_strong_avg.std().item():.4f}")
-                        print(f"[Weight Stats] synth_raw: norm={torch.norm(w1_synth_raw).item():.2f} (×{w1_norm_ratio.item():.4f})")
-                        print(f"[Weight Stats] synth_rescaled: norm={torch.norm(w1_synth).item():.2f}, std={w1_synth.std().item():.4f}")
-                        print(f"[Weight Stats] Norm preserved: {torch.allclose(torch.norm(w1_synth), torch.norm(w1_strong_avg), rtol=1e-2)}")
-                    
-                    # Forward pass through synthetic expert
-                    # Replicate MixtralBlockSparseTop2MLP.forward logic
-                    h = hidden_states[token_idx].unsqueeze(0)  # [1, hidden_dim]
-                    # current_hidden_states = act_fn(w1(h)) * w3(h)
-                    # current_hidden_states = w2(current_hidden_states)
-                    intermediate = self.experts[0].act_fn(F.linear(h, w1_synth)) * F.linear(h, w3_synth)
-                    output = F.linear(intermediate, w2_synth)
-                    
-                    final_hidden_states[token_idx] = output.squeeze(0)
-                
-                final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-                return final_hidden_states, router_logits
         if len(routed_tok) == 1 and routed_tok[0] == 8:
             routing_weights_random = torch.ones(routing_weights.shape[0], 1).to(routing_weights.device)
             routing_weights = torch.cat((routing_weights, routing_weights_random), dim=-1)
@@ -1225,8 +1107,6 @@ class MixtralDecoderLayer(nn.Module):
             kwargs.get("num_experts_per_tok"),
             kwargs.get("routed_tok"),
             kwargs.get("dynamic_expert_routing_threshold"),
-            kwargs.get("enable_layerwise_contrast"),
-            kwargs.get("use_onepass_lc"),
         )
         hidden_states = residual + hidden_states
 
@@ -1412,7 +1292,6 @@ class MixtralModel(MixtralPreTrainedModel):
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[List] = None,
         dynamic_expert_routing_threshold: Optional[float] = None,
-        use_onepass_lc: Optional[bool] = None,
     ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = (
             output_attentions
@@ -1553,8 +1432,6 @@ class MixtralModel(MixtralPreTrainedModel):
                     num_experts_per_tok=num_experts_per_tok,
                     routed_tok=routed_tok,
                     dynamic_expert_routing_threshold=dynamic_expert_routing_threshold,
-                    enable_layerwise_contrast=(decoder_layer.self_attn.layer_idx >= (self.config.num_hidden_layers // 2)),
-                    use_onepass_lc=use_onepass_lc,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1657,7 +1534,6 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[List] = None,
         dynamic_expert_routing_threshold: Optional[float] = None,
-        use_onepass_lc: Optional[bool] = None,
     ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
         r"""
         Args:
@@ -1720,7 +1596,6 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
             num_experts_per_tok=num_experts_per_tok if num_experts_per_tok else self.config.num_experts_per_tok,
             routed_tok=routed_tok if routed_tok else self.config.routed_tok,
             dynamic_expert_routing_threshold=dynamic_expert_routing_threshold if dynamic_expert_routing_threshold else self.config.dynamic_expert_routing_threshold,
-            use_onepass_lc=use_onepass_lc,
         )
 
         hidden_states = outputs[0]
@@ -1832,7 +1707,6 @@ class MixtralForCausalLM(MixtralPreTrainedModel):
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
                 "output_router_logits": output_router_logits,
-                "use_onepass_lc": getattr(self, "use_onepass_lc", False),
             }
         )
         return model_inputs
